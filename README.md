@@ -1,4 +1,4 @@
-# py-agents — 模块化多智能体框架
+# 模块化多智能体框架
 
 基于 Anthropic SDK 构建的多智能体推理框架，支持 ReAct、Plan-and-Solve、Tree of Thoughts、Supervisor 和 Network 五种推理范式。
 
