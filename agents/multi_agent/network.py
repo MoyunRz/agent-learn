@@ -20,6 +20,7 @@ from collections import deque
 from agents.tools import ToolRegistry
 from .agents.worker import WorkerAgent
 from agents.logging_config import get_logger
+from .. import ReActAgent
 
 logger = get_logger(__name__)
 
