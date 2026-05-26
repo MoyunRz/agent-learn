@@ -19,7 +19,9 @@ import json
 import os
 import re
 import hashlib
-from typing import Any
+import urllib.request
+import urllib.error
+from typing import Any, Protocol
 
 
 # ═══════════════════ 第1步：文档加载 ═══════════════════
@@ -198,6 +200,71 @@ class TFIDFEmbedder:
         return [self.encode(doc) for doc in documents]
 
 
+# ═══════════════════ Embedder 接口 ═══════════════════
+
+class EmbedderProtocol(Protocol):
+    """Embedder 的鸭子类型接口 —— 任何实现了 encode + encode_batch 的类都可以
+    作为 VectorStore 的 embedder，不用继承特定基类。"""
+
+    def encode(self, text: str) -> list[float]: ...
+    def encode_batch(self, documents: list[str]) -> list[list[float]]: ...
+
+
+# ═══════════════════ 可选：API Embedder（真正理解语义） ═══════════════════
+
+class MiniMaxEmbedder:
+    """用 MiniMax Embedding API 替代 TF-IDF，真正理解「省钱≈降低成本」。
+
+    与 TFIDFEmbedder 的区别：
+      - 不需要 fit()：词表是 MiniMax 预训练好的，加载即用
+      - 不需要分词：直接传原文，模型内部处理
+      - 理解语义：上下文相似的词向量自然相近
+      - 向量维度：MiniMax embo-01 模型固定 1536 维
+
+    用法：
+        embedder = MiniMaxEmbedder(api_key="sk-xxx")
+        vec = embedder.encode("远程办公能省多少钱？")  # → 1536维向量
+
+        rag = SimpleRAG(embedder=embedder)  # 替换 TF-IDF
+    """
+
+    def __init__(self, api_key: str, base_url: str = "https://api.minimaxi.com",
+                 model: str = "embo-01"):
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.dim = 1536  # embo-01 输出维度
+
+    def encode(self, text: str) -> list[float]:
+        """调用 MiniMax Embedding API 将文本转为 1536 维语义向量。
+
+        内部用 urllib 发送 HTTP POST，不引入额外依赖。
+        """
+        url = f"{self.base_url}/v1/embeddings"
+        payload = json.dumps({
+            "model": self.model,
+            "input": text,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(url, data=payload, method="POST")
+        req.add_header("Authorization", f"Bearer {self.api_key}")
+        req.add_header("Content-Type", "application/json")
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                return body["data"][0]["embedding"]
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8") if e.fp else ""
+            raise RuntimeError(
+                f"Embedding API 请求失败 (HTTP {e.code}): {err_body[:200]}"
+            ) from e
+
+    def encode_batch(self, documents: list[str]) -> list[list[float]]:
+        """批量编码。MiniMax 可能支持一次传入数组，这里逐条调用做简单实现。"""
+        return [self.encode(doc) for doc in documents]
+
+
 # ═══════════════════ 第4步：向量检索 ═══════════════════
 
 class VectorStore:
@@ -208,12 +275,11 @@ class VectorStore:
       2. 用户查询同样向量化
       3. 用余弦相似度找到最相关的 Top-K 个 chunk
 
-    余弦相似度公式：
-      cos(a, b) = a·b / (|a| × |b|)
-      值域 [-1, 1]，越接近 1 越相似
+    embedder 可以是 TFIDFEmbedder 或 MiniMaxEmbedder，只要实现了
+    encode() 和 encode_batch() 即可（鸭子类型，无需继承）。
     """
 
-    def __init__(self, embedder: TFIDFEmbedder):
+    def __init__(self, embedder: EmbedderProtocol):
         self.embedder = embedder
         self.chunks: list[dict[str, Any]] = []          # 块元信息
         self.vectors: list[list[float]] = []             # 对应的向量
@@ -262,19 +328,26 @@ class VectorStore:
 class SimpleRAG:
     """完整的 RAG 管线 —— 加载文档 → 分块 → 建索引 → 查询。
 
-    与 LLM 的交互方式：
-      1. search(query)   → 返回相关 chunk（供外部 Tool 调用，ReActAgent 使用）
-      2. query(question) → 完整流程：检索 + 组装 prompt（需传入 LLM 客户端）
+    embedder 可切换：
+      - 不传 → 默认用 TFIDFEmbedder（零依赖，教育用途）
+      - 传 MiniMaxEmbedder → 语义级检索（需 API Key）
 
     用法：
+      # 默认 TF-IDF
       rag = SimpleRAG(chunk_size=300, top_k=3)
-      rag.load_from_file("knowledge.txt")        # 加载文档，自动分块+建索引
-      results = rag.search("远程办公的优缺点")    # 纯检索，返回 chunk
+      rag.load_from_file("knowledge.txt")
+      results = rag.search("远程办公的优缺点")
+
+      # 切换到 MiniMax Embedding API
+      embedder = MiniMaxEmbedder(api_key="sk-xxx")
+      rag = SimpleRAG(embedder=embedder)
+      rag.load_from_file("knowledge.txt")
     """
 
-    def __init__(self, chunk_size: int = 500, overlap: int = 50, top_k: int = 3):
+    def __init__(self, chunk_size: int = 500, overlap: int = 50, top_k: int = 3,
+                 embedder: EmbedderProtocol | None = None):
         self.chunker = TextChunker(chunk_size=chunk_size, overlap=overlap)
-        self.embedder = TFIDFEmbedder()
+        self.embedder = embedder or TFIDFEmbedder()
         self.vector_store = VectorStore(self.embedder)
         self.top_k = top_k
         self._indexed = False
@@ -307,9 +380,11 @@ class SimpleRAG:
         self._fit_and_index(chunks)
 
     def _fit_and_index(self, chunks: list[dict[str, Any]]):
-        """在所有块上训练 TF-IDF 词表，然后存入向量库。"""
+        """向量化并存入向量库。TF-IDF 需要先 fit() 建词表，API Embedder 跳过此步。"""
         texts = [c["content"] for c in chunks]
-        self.embedder.fit(texts)
+        # TF-IDF 需要 fit 建立词表，MiniMaxEmbedder 不需要
+        if hasattr(self.embedder, 'fit'):
+            self.embedder.fit(texts)
         self.vector_store.add_chunks(chunks)
         self._indexed = True
 
@@ -350,9 +425,11 @@ class SimpleRAG:
 
     def stats(self) -> dict:
         """返回索引统计信息。"""
+        is_tfidf = hasattr(self.embedder, 'vocabulary')
         return {
             "chunk_count": len(self.vector_store.chunks),
-            "vocab_size": len(self.embedder.vocabulary),
+            "embedder": "TF-IDF" if is_tfidf else "MiniMax API",
+            "vocab_size": len(self.embedder.vocabulary) if is_tfidf else self.embedder.dim,
             "top_k": self.top_k,
             "chunk_size": self.chunker.chunk_size,
             "indexed": self._indexed,
